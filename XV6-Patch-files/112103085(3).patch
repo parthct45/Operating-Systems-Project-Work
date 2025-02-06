@@ -1,0 +1,79 @@
+diff --git a/kalloc.c b/kalloc.c
+index 14cd4f4..9dbc148 100644
+--- a/kalloc.c
++++ b/kalloc.c
+@@ -8,14 +8,16 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "spinlock.h"
++#include "stddef.h"
+ 
+ void freerange(void *vstart, void *vend);
+ extern char end[]; // first address after kernel loaded from ELF file
+                    // defined by the kernel linker script in kernel.ld
+-
++ 
+ struct run {
+   struct run *next;
+-};
++  struct run *prev; 
++} ;  
+ 
+ struct {
+   struct spinlock lock;
+@@ -23,6 +25,8 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
++
++
+ // Initialization happens in two phases.
+ // 1. main() calls kinit1() while still using entrypgdir to place just
+ // the pages mapped by entrypgdir on free list.
+@@ -56,6 +60,9 @@ freerange(void *vstart, void *vend)
+ // which normally should have been returned by a
+ // call to kalloc().  (The exception is when
+ // initializing the allocator; see kinit above.)
++
++ 
+ void
+ kfree(char *v)
+ {
+@@ -70,8 +77,11 @@ kfree(char *v)
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+   r = (struct run*)v;
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
++  // Adding at the start of the list 
++  r->prev = NULL ;   // Setting the prev pointer to null 
++  r->next = kmem.freelist; // Setting the nextpointer  to the head 
++  kmem.freelist->prev = r ; // Setting the prev of head to r 
++  kmem.freelist = r; // Changing the head to r 
+   if(kmem.use_lock)
+     release(&kmem.lock);
+ }
+@@ -82,15 +92,17 @@ kfree(char *v)
+ char*
+ kalloc(void)
+ {
+-  struct run *r;
++  struct run *r ; 
+ 
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+-  r = kmem.freelist;
+-  if(r)
+-    kmem.freelist = r->next;
++  r = kmem.freelist ; 
++  if(r){
++    kmem.freelist = r->next; // Giving out the first node from the list     
++    kmem.freelist->prev = NULL ; 
++  }
++    	
+   if(kmem.use_lock)
+     release(&kmem.lock);
+-  return (char*)r;
+-}
++  return (char*)r;}
+ 

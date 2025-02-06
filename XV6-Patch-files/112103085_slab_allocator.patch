@@ -1,0 +1,220 @@
+diff --git a/defs.h b/defs.h
+index 82fb982..4982d44 100644
+--- a/defs.h
++++ b/defs.h
+@@ -27,9 +27,13 @@ int             exec(char*, char**);
+ 
+ // file.c
+ struct file*    filealloc(void);
++struct file*    get_file(void);
++struct file*    grow_fun(void);
+ void            fileclose(struct file*);
+ struct file*    filedup(struct file*);
+ void            fileinit(void);
++void            init_cache(void);
++void            return_file(struct file*);
+ int             fileread(struct file*, char*, int n);
+ int             filestat(struct file*, struct stat*);
+ int             filewrite(struct file*, char*, int n);
+diff --git a/file.c b/file.c
+index 24b32c2..f0c44f4 100644
+--- a/file.c
++++ b/file.c
+@@ -9,6 +9,9 @@
+ #include "spinlock.h"
+ #include "sleeplock.h"
+ #include "file.h"
++#define PGSIZE 4096
++#define NFILES (PGSIZE / sizeof(struct file))
++#define LENGTH NFILES / 32
+ 
+ struct devsw devsw[NDEV];
+ struct {
+@@ -16,6 +19,134 @@ struct {
+   struct file file[NFILE];
+ } ftable;
+ 
++struct page{
++	char *start ;
++	uint bitmap[LENGTH] ;
++	struct page *next;
++};
++
++struct{
++	struct spinlock lock;
++	struct page *cache;
++	int page_count ;
++}allocator ;
++
++// Init function 
++void init_cache(void) {
++	initlock(&allocator.lock, "allocator");
++	allocator.cache = 0; 
++	allocator.page_count = 0;
++};
++
++// Get file function
++struct file * get_file(void){ 
++	acquire(&allocator.lock) ;
++	if (!allocator.cache){
++                struct page *p = (struct page *)kalloc() ;  
++                if (p == 0){
++			// Allocation failed. 
++                        cprintf("Memory alloc failed") ;
++			release(&allocator.lock) ;
++                        return 0 ;
++                }
++		p->start = (char *)p ; 
++		allocator.page_count += 1 ; 
++		for (int i = 0 ; i < LENGTH ; i++){
++			p->bitmap[i] = 0 ;
++		}
++		p->next = allocator.cache ;
++		allocator.cache = p ; 
++
++	}
++	struct page *curr = allocator.cache ;
++	
++	for(int i = 0 ; i < allocator.page_count ; i++){
++		for(int j = 0 ; j < LENGTH ; j++){
++			for(int k = 0 ; k < 32 ; k++){
++				int intend = (1 << k) ;
++				if (!(curr->bitmap[j] & intend)){
++					// Found the first zero
++					curr->bitmap[j] |= intend ; // Mark slot as allocated 
++					int index = j*32 + k; 
++					int offset = index*sizeof(struct file) ;
++					char *location = curr->start + offset; 
++					struct file* f = (struct file*)location;
++					release(&allocator.lock) ;
++					return f ;
++				}
++			}
++		}
++		curr = curr->next ; 
++	}
++	// Now need to grow the cache again
++	return grow_fun() ; 
++
++}
++
++struct file * grow_fun(void) {
++		//cprintf("Growing cache");
++                struct page *p = (struct page *)kalloc() ;
++
++                if (!p) {
++			// Allocation failed 
++                        cprintf("Memory alloc failed") ;
++			release(&allocator.lock) ;
++                        return 0 ;
++                }
++                p->start = (char *)p ;
++                allocator.page_count+=1 ;
++                for (int i = 0 ; i < LENGTH ; i++){
++                        p->bitmap[i] = 0 ;
++                }
++                p->next = allocator.cache ;
++                allocator.cache = p ;
++	        release(&allocator.lock) ;	
++	 	return get_file() ; 
++}
++
++void return_file(struct file *f) {
++	acquire(&allocator.lock) ;
++	struct page *prev = 0;
++	struct page *curr = allocator.cache;
++	while(curr){
++        	char *start = curr->start;
++		int tot_len = NFILES*sizeof(struct file);
++        	char *end = start + tot_len;
++        	if ((char *)f >= start && (char *)f < end) {
++            		// Calculate the index of the file in the slab
++            		int index = ((char *)f - start) / sizeof(struct file);
++           	 	int bitmap_ind = index/32;
++           	 	int bit_offset = index%32;
++
++            		// Clear the corresponding bit in the bitmap
++	    		int intend = ~(1 << bit_offset) ; 
++            		curr->bitmap[bitmap_ind] &= intend;
++			int free = 1;
++            		for(int i = 0; i < LENGTH; i++) {
++                		if (curr->bitmap[i] != 0){
++                   	 	 free = 0;
++                   		 break;
++                		}
++
++            		}
++			if(free){
++                		if(prev){
++                    			prev->next = curr->next;
++                		}else{
++                    			allocator.cache = curr->next;
++                		}
++                		kfree((char *)curr);
++				//cprintf("Page shrinked") ; 
++                		allocator.page_count--;
++            		} 
++            		break;
++        	}
++		prev = curr ;
++		curr = curr->next ;
++	}
++	release(&allocator.lock) ;
++}
++
+ void
+ fileinit(void)
+ {
+@@ -29,15 +160,17 @@ filealloc(void)
+   struct file *f;
+ 
+   acquire(&ftable.lock);
+-  for(f = ftable.file; f < ftable.file + NFILE; f++){
+-    if(f->ref == 0){
+-      f->ref = 1;
+-      release(&ftable.lock);
+-      return f;
+-    }
+-  }
++//  for(f = ftable.file; f < ftable.file + NFILE; f++){
++//    if(f->ref == 0){
++//      f->ref = 1;
++//      release(&ftable.lock);
++//      return f;
++//    }
++//  }
++  f = get_file() ;
++  f->ref = 1 ; 
+   release(&ftable.lock);
+-  return 0;
++  return f;
+ }
+ 
+ // Increment ref count for file f.
+@@ -62,12 +195,13 @@ fileclose(struct file *f)
+   if(f->ref < 1)
+     panic("fileclose");
+   if(--f->ref > 0){
+-    release(&ftable.lock);
++   release(&ftable.lock);
+     return;
+   }
+   ff = *f;
+   f->ref = 0;
+   f->type = FD_NONE;
++  return_file(f) ;
+   release(&ftable.lock);
+ 
+   if(ff.type == FD_PIPE)
+diff --git a/main.c b/main.c
+index 9924e64..a9f8520 100644
+--- a/main.c
++++ b/main.c
+@@ -30,6 +30,7 @@ main(void)
+   tvinit();        // trap vectors
+   binit();         // buffer cache
+   fileinit();      // file table
++  init_cache();
+   ideinit();       // disk 
+   startothers();   // start other processors
+   kinit2(P2V(4*1024*1024), P2V(PHYSTOP)); // must come after startothers()
